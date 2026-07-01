@@ -75,11 +75,21 @@ scripts/simulate_call.py   Fires a full 5-turn call at a running instance
 Create a key at https://console.groq.com/keys → `GROQ_API_KEY`.
 
 ### 2. Firebase / Firestore
-1. https://console.firebase.google.com → create a project → enable Firestore
-   (Native mode, any region).
-2. Project settings → Service accounts → **Generate new private key** →
-   save as `credentials/firebase-service-account.json`.
-3. Set `FIRESTORE_PROJECT_ID` to the Firebase project ID.
+1. https://console.firebase.google.com → create a project.
+2. **Firestore Database** (left sidebar) → click **Create database**
+   — this step is easy to miss: creating the Firebase project does *not*
+   automatically provision a Firestore database. Choose **Start in test
+   mode** and pick any location (e.g. `asia-south1` for India). Wait ~30–60
+   seconds after creating it before your app can connect.
+3. Project settings (gear icon) → Service accounts tab → **Generate new
+   private key** → save the downloaded file as
+   `credentials/firebase-service-account.json`.
+4. Set `FIRESTORE_PROJECT_ID` to the Firebase project ID (visible at the
+   top of the console, e.g. `dental-booking-agent-bed4e`).
+
+**If key generation fails with `iam.disableServiceAccountKeyCreation`:**
+see the note at the end of the Google Calendar section below — the fix is
+the same for both services.
 
 ### 3. Google Calendar
 
@@ -125,25 +135,42 @@ and generate the service-account key again.
 
 ### 4. Twilio
 1. https://console.twilio.com → free trial account → note the **Account
-   SID** and **Auth Token**.
-2. For `TWILIO_FROM_NUMBER`, use a trial number Twilio gives you, or one of
-   Twilio's [magic test numbers](https://www.twilio.com/docs/iam/test-credentials)
-   during development (`+15005550006` is the standard "valid" test number).
-3. On a trial account you can only SMS numbers you've verified in the
-   console — verify your own phone to test real delivery.
+   SID** and **Auth Token** from the dashboard.
+2. `TWILIO_FROM_NUMBER` = the trial phone number Twilio assigns you
+   (visible on the dashboard, e.g. `+1XXXXXXXXXX`). This is the
+   **sender** — don't confuse it with your own mobile number.
+3. **Trial accounts can only SMS numbers you've explicitly verified.**
+   Go to https://console.twilio.com/us1/develop/phone-numbers/manage/verified
+   → **Add a new number** → enter your real mobile number in E.164 format
+   (e.g. `+91XXXXXXXXXX`) → Twilio sends an OTP → enter it to confirm.
+4. Whichever number you use as `caller_phone_number` in a webhook payload
+   (or in `scripts/simulate_call.py`) **must be this verified number** —
+   Twilio's published "magic test numbers" like `+15005550006` only work
+   with Twilio's separate fake test credentials, not your real trial
+   Account SID, and will fail with error 21608 ("unverified number") if
+   you try to use them with real credentials.
 
-### 5. Local run
+### 5. Admin API key
+This one isn't issued by any service — it's a password you invent yourself
+to protect the `/admin/*` endpoints. Generate one:
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+Put the result in `.env` as `ADMIN_API_KEY`, and send it as the
+`x-admin-api-key` header on every admin request.
+
+### 6. Local run
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in the keys above
+cp .env.example .env   # fill in the keys above -- never put real keys in .env.example itself
 uvicorn app.main:app --reload
 ```
 
 Visit `http://localhost:8000/health` to confirm it's up.
 
-### 6. Run the tests
+### 7. Run the tests
 
 ```bash
 pytest tests/ -v
@@ -152,15 +179,71 @@ pytest tests/ -v
 All 14 tests mock Firestore/Calendar/Twilio/Groq, so they run with no
 credentials at all — this is what CI would run.
 
-### 7. Simulate a full call locally
+### 8. Simulate a full call locally
 
+In a second terminal (same venv activated):
 ```bash
 python scripts/simulate_call.py --url http://localhost:8000
 ```
 
-Walks a fake caller through all 5 turns and prints what the agent would say
-at each step. Requires real credentials configured (this hits real Groq +
-real Calendar + real Twilio).
+Walks a fake caller through 5 turns and prints what the agent says at each
+step. This hits real Groq, real Calendar, and real Twilio, so it needs step
+1–5 fully done first. If you re-run it, bump the date/time in
+`scripts/simulate_call.py` each time — the previous run's slot will already
+show as booked on your calendar.
+
+## Troubleshooting
+
+**`Cloud Firestore API has not been used in project ... or it is disabled`**
+→ You created the Firebase project but never clicked "Create database"
+inside Firestore Database. See Firebase setup step 2 above.
+
+**`iam.disableServiceAccountKeyCreation` when generating a service-account
+key** → Your Google account is attached to an organization (common with
+Workspace/company/college emails) that blocks service-account key creation
+by default. For Calendar, this repo already avoids the problem entirely via
+OAuth user credentials (see step 3). For Firestore, if you hit this too,
+the fastest fix is creating the Firebase project under a plain personal
+`@gmail.com` account, which normally has no organization policy attached.
+
+**`groq.GroqError: The api_key client option must be set`** → `GROQ_API_KEY`
+isn't reaching the app. Check `.env` has the real key with no quotes, run
+`python -c "from app.config import get_settings; print(repr(get_settings().groq_api_key))"`
+to confirm what's actually being loaded, and remember `uvicorn --reload`
+does **not** re-read `.env` on file save — you have to fully stop (Ctrl+C)
+and restart the server after changing `.env`.
+
+**`ModuleNotFoundError: No module named 'app'` when running a script in
+`scripts/`** → Run it as a module from the project root instead:
+`python -m scripts.generate_calendar_token`, or set
+`PYTHONPATH` to the project root first.
+
+**Twilio error 21608, "number is unverified"** → See Twilio setup step 3.
+Trial accounts require every recipient number to be explicitly verified.
+
+**`500 Internal Server Error` hitting `/webhook/vapi` from the Swagger UI
+(`/docs`)** → The endpoint expects a specific VAPI-shaped JSON body; an
+empty "Try it out" request body will fail. Paste a full example payload
+(see "Wiring up Vapi" below for the tool schema, or copy a payload shape
+from `scripts/simulate_call.py`'s `build_payload` function).
+
+**GitHub blocks your push with "Push cannot contain secrets"** → A real API
+key ended up committed into `.env.example` at some point (it should only
+ever contain placeholders). Rotate the exposed key immediately (treat
+anything that touched a commit as burned), fix `.env.example` back to
+placeholders, and if the leak is buried in old commits rather than just the
+latest one, the cleanest fix is often a fresh orphan branch:
+```bash
+git checkout --orphan clean-main
+git add -A
+git commit -m "Dental appointment booking agent backend"
+git branch -D main
+git branch -m main
+git push -u origin main --force
+```
+Only safe to force-push like this if the remote never successfully received
+the bad commits in the first place (check: did any earlier push actually
+succeed, or were they all rejected?).
 
 ## Deploying (Railway)
 
