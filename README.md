@@ -1,42 +1,66 @@
-# Dental Appointment Booking Agent — Backend
+# Dental Appointment Booking Agent — Backend + Dashboard
 
-Backend for a voice AI dental receptionist. Sits behind a Vapi voice assistant,
-owns the multi-turn booking conversation end-to-end, and books real Google
-Calendar events with a Twilio SMS confirmation, logging everything to
-Firestore.
+Backend for a voice AI dental receptionist, plus a Streamlit dashboard on
+top of it. The backend sits behind a Vapi voice assistant, owns the
+multi-turn booking conversation end-to-end, and books real Google Calendar
+events with a Twilio SMS confirmation, logging everything to Firestore. The
+dashboard is a pure frontend for watching it work — bookings, conversation
+transcripts, and a live call simulator — with no business logic of its own.
 
 ## Architecture
 
 ```
-Caller ↔ Vapi (STT/TTS + telephony)
-              │  tool-calls webhook, once per turn
-              ▼
-        FastAPI backend  (this repo)
-              │
-   ┌──────────┼───────────────┬──────────────┐
-   ▼          ▼               ▼              ▼
-State FSM   LangChain+Groq  Google Calendar  Twilio
-(app/core)  (extraction)     (real booking)   (SMS)
-   │
-   ▼
-Firestore (conversation state + booking log)
+                     Caller ↔ Vapi (STT/TTS + telephony)
+                                  │  tool-calls webhook, once per turn
+                                  ▼
+                         FastAPI backend  (this repo)
+                                  │
+        ┌──────────┬─────────────┼──────────────┬──────────────┐
+        ▼          ▼               ▼              ▼
+   Slot-filling  LangChain+Groq  Google Calendar  Twilio
+   (app/core)     (extraction)    (real booking)   (SMS)
+        │
+        ▼
+   Firestore (conversation state + booking log)
+        ▲
+        │  admin API (bookings, conversation history)
+        │
+   Streamlit dashboard  (streamlit_app/) ── also POSTs to /webhook/vapi
+                                             directly for the call simulator
 ```
 
 **Key decision: Vapi is a thin voice layer, not the conversation brain.**
 Vapi's assistant is configured with exactly one custom tool, `process_turn`,
 which fires on every user turn and passes the raw utterance to this backend.
-This backend — not Vapi's own LLM — owns the state machine
-(`app/core/state_machine.py`), so "where is this caller in the flow" lives in
-one place (Firestore), not split between our server and Vapi's dialog
-manager. This is also what makes multi-turn state survive across separate
-webhook HTTP hits: nothing is held in memory between requests, everything is
-re-read from Firestore keyed by `call.id`.
+This backend — not Vapi's own LLM — owns all conversation logic, so "where
+is this caller in the flow" lives in one place (Firestore), not split
+between our server and Vapi's dialog manager. This is also what makes
+multi-turn state survive across separate webhook HTTP hits: nothing is held
+in memory between requests, everything is re-read from Firestore keyed by
+`call.id`.
 
-**Why LangChain here is deliberately thin.** Extraction (`app/core/extraction.py`)
-is one Groq call per turn with a stage-specific prompt and JSON-mode output.
-A full agent/tool-loop would add latency and non-determinism for what is a
-straightforward 4-slot form-fill. LangChain is doing NLU; the FSM does control
-flow.
+**Dynamic slot-filling, not a rigid linear script.** Every turn runs one
+comprehensive Groq extraction (`app/core/extraction.py`) that pulls
+whatever's present in that utterance — name, service, date, time,
+confirmation — all at once, regardless of which are still missing. The
+state machine (`app/core/state_machine.py`) recomputes "what's still
+missing" fresh each turn (`_next_missing_stage`) and asks only for that. A
+caller who front-loads several facts in one sentence ("I'm Asha, I need a
+cleaning tomorrow at 2pm") fills multiple slots and skips straight ahead;
+a caller who gives one fact at a time gets asked one thing at a time. Same
+code path either way — nothing hardcoded to a fixed number of turns.
+
+**Why LangChain here is deliberately thin.** Extraction is one Groq call
+per turn with a single comprehensive JSON-mode prompt. A full agent/tool-
+loop would add latency and non-determinism without adding value here.
+LangChain is doing NLU; the state machine does control flow and safety
+(e.g. always reading back a confirmation summary before booking, even if
+the caller's message already sounded like a yes).
+
+**Google Calendar auth is OAuth user credentials, not a service-account
+key.** Many GCP projects block service-account key creation by default;
+OAuth sidesteps that and also skips the "share the calendar with a service
+account" step entirely. See Setup step 3 below.
 
 **Scaling to 1,000 clinics.** Every document (conversation, booking) already
 carries `clinic_id`. The only missing piece for true multi-tenancy is a
@@ -44,6 +68,30 @@ carries `clinic_id`. The only missing piece for true multi-tenancy is a
 Twilio number, looked up at the top of the webhook handler instead of the
 current single hardcoded `GOOGLE_CALENDAR_ID`. State, extraction, and booking
 logic don't change at all — see "What I'd do with more time" below.
+
+## Walking through one real call
+
+```
+Caller: "hai my name is shanmukh"
+  → extraction finds: patient_name="Shanmukh"
+  → still missing: service → asks "Thanks, Shanmukh. What can we help you with today?"
+
+Caller: "i need root canal cleaning on tomorrow 2 PM"
+  → extraction finds: service="root_canal", preferred_date="2026-07-03", preferred_time="14:00" -- ALL from one sentence
+  → calendar freebusy check passes
+  → nothing left missing → shows confirmation summary:
+    "Just to confirm: Shanmukh, a root canal appointment on 2026-07-03 at 14:00. Shall I book that in?"
+
+Caller: "yes"
+  → extraction finds: confirmed=true
+  → creates the real Google Calendar event
+  → sends the real Twilio SMS
+  → saves the booking to Firestore
+  → "You're all set! You'll get a confirmation text shortly. Anything else?"
+```
+
+Three turns, not five — because slot-filling doesn't force one question
+per fact when the caller volunteers several at once.
 
 ## Project structure
 
@@ -55,18 +103,23 @@ app/
     webhook.py             POST /webhook/vapi — VAPI tool-calls intake
     admin.py                GET /admin/bookings, /admin/conversations/{id}
   core/
-    state_machine.py       The FSM: greeting → name → service → datetime → confirm → booked
-    extraction.py          LangChain + Groq entity extraction per stage
-    prompts.py             Extraction prompts + assistant-facing copy
+    state_machine.py       Dynamic slot-filling flow control (see above)
+    extraction.py          LangChain + Groq comprehensive per-turn extraction
+    prompts.py             Extraction prompt + assistant-facing copy + retry copy
   services/
     firestore_service.py   All Firestore reads/writes
-    calendar_service.py    Google Calendar freebusy check + event creation
+    calendar_service.py    Google Calendar freebusy check + event creation (OAuth)
     sms_service.py         Twilio confirmation SMS
   models/
     schemas.py             Pydantic v2 models (VAPI payloads + internal state)
     enums.py                ConversationStage, ServiceType
-tests/                     pytest, all external services mocked
-scripts/simulate_call.py   Fires a full 5-turn call at a running instance
+tests/                     pytest, all external services mocked (18 tests)
+scripts/
+  simulate_call.py         Fires a scripted call at a running instance
+  generate_calendar_token.py  One-time OAuth authorization for Calendar access
+streamlit_app/
+  app.py                    Dashboard: overview, bookings, conversations, live call simulator
+  requirements.txt          Streamlit-specific deps, kept separate from the backend's
 ```
 
 ## Setup
@@ -176,10 +229,26 @@ Visit `http://localhost:8000/health` to confirm it's up.
 pytest tests/ -v
 ```
 
-All 14 tests mock Firestore/Calendar/Twilio/Groq, so they run with no
+All 18 tests mock Firestore/Calendar/Twilio/Groq, so they run with no
 credentials at all — this is what CI would run.
 
-### 8. Simulate a full call locally
+### 8. Run the Streamlit dashboard
+
+```bash
+pip install -r streamlit_app/requirements.txt
+streamlit run streamlit_app/app.py
+```
+
+Opens at `http://localhost:8501`. It auto-loads `BACKEND_URL` and
+`ADMIN_API_KEY` from the same `.env` the backend uses (no need to type them
+in) — override either under "Advanced" in the sidebar if needed. Four
+views: **Overview** (health + quick stats), **Bookings** (every confirmed
+appointment), **Conversations** (pick any call, see extracted slots + full
+transcript), and **Simulate a call** (a live chat interface that fires real
+webhook requests at your backend — better than the scripted
+`simulate_call.py` for freely testing the slot-filling behavior).
+
+### 9. Simulate a full call locally
 
 In a second terminal (same venv activated):
 ```bash
@@ -245,20 +314,53 @@ Only safe to force-push like this if the remote never successfully received
 the bad commits in the first place (check: did any earlier push actually
 succeed, or were they all rejected?).
 
+**`git push` rejected with "Updates were rejected because the remote
+contains work that you do not have locally"** → Something (often a direct
+edit on github.com) created a commit on the remote that isn't in your local
+history yet. Not a conflict with anything risky, just needs merging in:
+```bash
+git fetch origin
+git log origin/main --oneline -5   # see what's on the remote
+git pull --rebase origin main       # replay your local commits on top
+git push
+```
+If the rebase reports a conflict, it names the file(s) — resolve the
+conflict markers in that file, `git add <file>`, then `git rebase --continue`.
+
 ## Deploying (Railway)
 
 1. Push this repo to GitHub.
 2. https://railway.app → New Project → Deploy from GitHub repo.
-3. Add all variables from `.env.example` under Variables — for
-   `FIREBASE_CREDENTIALS_JSON` and `GOOGLE_CALENDAR_CREDENTIALS_JSON`, paste
-   the **entire contents** of each service-account JSON file as the value
-   (the code detects these and writes them to a temp file at runtime, so you
-   don't need to ship secret files in the repo).
+3. Service → Variables → **Raw Editor** → paste every variable from
+   `.env.example`, filled in with real values. For the two credential
+   *files* (which can't be uploaded to Railway), paste their entire JSON
+   contents as single-line env vars instead:
+   - `FIREBASE_CREDENTIALS_JSON` = full contents of
+     `credentials/firebase-service-account.json`
+   - `GOOGLE_CALENDAR_TOKEN_JSON` = full contents of
+     `credentials/calendar-token.json`
+   (the code detects these env vars and writes them to a temp file at
+   runtime, so no secret files need to ship in the repo).
 4. Railway auto-detects `railway.json` / the `Procfile` and runs
    `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
-5. Once deployed, hit `https://<your-app>.up.railway.app/health`.
+5. Service → Settings → Networking → **Generate Domain** to get a public
+   URL, e.g. `https://your-app.up.railway.app`.
+6. Verify: `curl https://your-app.up.railway.app/health`.
 
 (Render/Vercel work the same way — same start command, same env vars.)
+
+### Optional: deploying the Streamlit dashboard too
+
+Not required by the assignment (only the backend needs a public URL), but
+useful for the Loom demo. https://share.streamlit.io → New app → point it
+at this repo, main file path `streamlit_app/app.py`. Under the app's
+**Secrets**, set:
+```
+BACKEND_URL = "https://your-app.up.railway.app"
+ADMIN_API_KEY = "your_admin_key"
+```
+Streamlit Cloud secrets are read as environment variables the same way
+`load_dotenv()` picks up a local `.env`, so no code changes are needed.
 
 ## Wiring up Vapi
 
